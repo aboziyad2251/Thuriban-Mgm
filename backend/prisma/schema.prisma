@@ -1,0 +1,210 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ── Enums ─────────────────────────────────────────────────────────
+enum Tier {
+  ADMIN
+  MANAGER
+  EMPLOYEE
+}
+
+enum OffboardType {
+  FIRED
+  RESIGNED
+}
+
+enum AccessLevel {
+  PRIVATE
+  DEPARTMENT
+  GLOBAL
+}
+
+// ── Models ────────────────────────────────────────────────────────
+model CompanyProfile {
+  id           String   @id @default(uuid()) @db.Uuid
+  name         String
+  logoUrl      String?
+  mission      String?
+  contactEmail String?
+  contactPhone String?
+  address      String?
+  website      String?
+  createdAt    DateTime @default(now()) @db.Timestamptz()
+  updatedAt    DateTime @updatedAt @db.Timestamptz()
+
+  departments Department[]
+  users       User[]
+
+  @@map("CompanyProfile")
+}
+
+model Department {
+  id          String   @id @default(uuid()) @db.Uuid
+  name        String
+  companyId   String   @db.Uuid
+  managerId   String?  @unique @db.Uuid
+  // ── Hierarchy fields ─────────────────────────────────────────
+  parentId    String?  @db.Uuid
+  description String?
+  headCount   Int      @default(0)
+  level       Int      @default(0)    // depth: 0 = root
+  path        String?                 // materialized path '/slug/child-slug'
+  position    Int      @default(0)    // sort order among siblings
+  createdAt   DateTime @default(now()) @db.Timestamptz()
+  updatedAt   DateTime @updatedAt @db.Timestamptz()
+
+  // ── Relations ─────────────────────────────────────────────────
+  company  CompanyProfile @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  manager  User?          @relation("DepartmentManager", fields: [managerId], references: [id], onDelete: SetNull)
+  users    User[]
+
+  // Self-referencing hierarchy
+  parent   Department?  @relation("DeptHierarchy", fields: [parentId], references: [id], onDelete: SetNull)
+  children Department[] @relation("DeptHierarchy")
+
+  documents Document[]
+
+  @@unique([name, companyId, parentId], name: "uq_department_name_parent")
+  @@index([companyId])
+  @@index([parentId])
+  @@index([companyId, level])
+  @@index([path])
+  @@map("Department")
+}
+
+model User {
+  id                String        @id @default(uuid()) @db.Uuid
+  email             String        @unique
+  passwordHash      String
+  name              String
+  tier              Tier
+  departmentId      String?       @db.Uuid
+  companyId         String        @db.Uuid
+  // ── Profile & hierarchy ───────────────────────────────────────
+  jobTitle          String?
+  reportsToId       String?       @db.Uuid
+  // ── Lifecycle fields ──────────────────────────────────────────
+  isActive          Boolean       @default(true)
+  tokenVersion      Int           @default(0)
+  terminationDate   DateTime?     @db.Timestamptz()
+  terminationReason String?
+  offboardType      OffboardType?
+  terminatedById    String?       @db.Uuid
+  createdAt         DateTime      @default(now()) @db.Timestamptz()
+  updatedAt         DateTime      @updatedAt @db.Timestamptz()
+
+  // ── Relations ─────────────────────────────────────────────────
+  department          Department?    @relation(fields: [departmentId], references: [id], onDelete: Cascade)
+  company             CompanyProfile @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  managedDepartment   Department?    @relation("DepartmentManager")
+  auditLogs           AuditLog[]     @relation("UserAuditLogs")
+
+  // Reporting line (self-relation)
+  reportsTo     User?  @relation("ReportingLine", fields: [reportsToId], references: [id], onDelete: SetNull)
+  directReports User[] @relation("ReportingLine")
+
+  // Termination trail (self-relation)
+  terminatedBy        User?  @relation("Terminations", fields: [terminatedById], references: [id])
+  terminatedEmployees User[] @relation("Terminations")
+
+  // Document relations
+  uploadedDocuments Document[]      @relation("Uploader")
+  sharedDocuments   DocumentShare[] @relation("SharedWithUser")
+  grantedShares     DocumentShare[] @relation("ShareGrantor")
+
+  @@index([companyId])
+  @@index([departmentId])
+  @@index([companyId, tier])
+  @@index([companyId, isActive])
+  @@index([email, isActive])
+  @@index([reportsToId])
+  @@map("User")
+}
+
+model Permission {
+  id          String  @id @default(uuid()) @db.Uuid
+  name        String  @unique
+  description String?
+
+  rolePermissions RolePermission[]
+
+  @@map("Permission")
+}
+
+model RolePermission {
+  roleId       Tier
+  permissionId String @db.Uuid
+
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+  @@index([permissionId])
+  @@map("RolePermission")
+}
+
+model Document {
+  id           String      @id @default(uuid()) @db.Uuid
+  name         String      @db.VarChar(255)
+  storagePath  String
+  mimeType     String
+  sizeBytes    Int
+  accessLevel  AccessLevel @default(PRIVATE)
+  companyId    String      @db.Uuid
+  uploadedById String      @db.Uuid
+  departmentId String?     @db.Uuid
+  tags         String[]    @default([])
+  createdAt    DateTime    @default(now()) @db.Timestamptz()
+  updatedAt    DateTime    @updatedAt @db.Timestamptz()
+
+  company    CompanyProfile @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  uploadedBy User           @relation("Uploader", fields: [uploadedById], references: [id], onDelete: Cascade)
+  department Department?    @relation(fields: [departmentId], references: [id], onDelete: SetNull)
+  sharedWith DocumentShare[]
+
+  @@index([companyId])
+  @@index([uploadedById])
+  @@index([departmentId])
+  @@index([accessLevel])
+  @@index([companyId, accessLevel])
+  @@map("Document")
+}
+
+model DocumentShare {
+  documentId  String   @db.Uuid
+  userId      String   @db.Uuid
+  grantedById String   @db.Uuid
+  createdAt   DateTime @default(now()) @db.Timestamptz()
+
+  document  Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  user      User     @relation("SharedWithUser", fields: [userId], references: [id], onDelete: Cascade)
+  grantedBy User     @relation("ShareGrantor", fields: [grantedById], references: [id], onDelete: Cascade)
+
+  @@id([documentId, userId])
+  @@index([userId])
+  @@index([grantedById])
+  @@map("DocumentShare")
+}
+
+model AuditLog {
+  id         String   @id @default(uuid()) @db.Uuid
+  userId     String?  @db.Uuid
+  action     String
+  resource   String
+  resourceId String?
+  metadata   Json     @default("{}")
+  ipAddress  String?
+  createdAt  DateTime @default(now()) @db.Timestamptz()
+
+  user User? @relation("UserAuditLogs", fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([userId, createdAt])
+  @@index([resource, resourceId])
+  @@index([createdAt])
+  @@map("AuditLog")
+}
