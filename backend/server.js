@@ -12,6 +12,7 @@ const users = [
   { id: 1, username: 'admin',   password: 'admin123',   name: 'Aung Kyaw', role: 'Administrator' },
   { id: 2, username: 'manager', password: 'manager123', name: 'Su Su',     role: 'Manager'       },
   { id: 3, username: 'aung',    password: 'aung123',    name: 'Aung Kyaw', role: 'Member'        },
+  { id: 4, username: 'ceo',     password: 'ceo123',     name: 'CEO',       role: 'Administrator' },
 ];
 
 app.post('/api/login', (req, res) => {
@@ -30,7 +31,8 @@ const departments = [
   { id: 'dept-4', name: 'Finance & Procurement',description: 'Finance, budget, procurement',   level: 1, parentId: 'dept-1' },
   { id: 'dept-5', name: 'IT & Digital Systems', description: 'Technology and digital ops',     level: 1, parentId: 'dept-1' },
   { id: 'dept-6', name: 'Programs & Activities',description: 'Club programs and events',       level: 1, parentId: 'dept-1' },
-  { id: 'dept-7', name: 'Marketing & PR',       description: 'Comms, branding, outreach',      level: 1, parentId: 'dept-1' },
+  { id: 'dept-7', name: 'Marketing',             description: 'Branding, campaigns, content',   level: 1, parentId: 'dept-1' },
+  { id: 'dept-8', name: 'Public Relations',     description: 'PR, media, external comms',       level: 1, parentId: 'dept-1' },
 ];
 const departmentMap = new Map(departments.map(d => [d.id, d.name]));
 
@@ -41,7 +43,7 @@ let members = [
   { id: 3, name: 'Su Su',     email: 'susu@thuriban.com',    phone: '+95 9 456 789 123', role: 'Manager', status: 'Active',   joinDate: '2024-03-10', departmentId: 'dept-3', reportsToId: 1    },
   { id: 4, name: 'Kyaw Zin',  email: 'kyawzin@thuriban.com', phone: '+95 9 321 654 987', role: 'Member',  status: 'Inactive', joinDate: '2024-04-05', departmentId: 'dept-4', reportsToId: 1    },
   { id: 5, name: 'Mya Mya',   email: 'myamya@thuriban.com',  phone: '+95 9 654 321 789', role: 'Member',  status: 'Active',   joinDate: '2024-05-12', departmentId: 'dept-6', reportsToId: 3    },
-  { id: 6, name: 'Zaw Win',   email: 'zawwin@thuriban.com',  phone: '+95 9 111 222 333', role: 'Member',  status: 'Active',   joinDate: '2025-01-08', departmentId: 'dept-7', reportsToId: 1    },
+  { id: 6, name: 'Zaw Win',   email: 'zawwin@thuriban.com',  phone: '+95 9 111 222 333', role: 'Member',  status: 'Active',   joinDate: '2025-01-08', departmentId: 'dept-7', reportsToId: 3    },
 ];
 
 let tasks = [

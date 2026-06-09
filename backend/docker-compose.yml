@@ -1,0 +1,14 @@
+services:
+  thuriban:
+    build: .
+    container_name: thuriban
+    restart: unless-stopped
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+    networks:
+      - proxy_network
+
+networks:
+  proxy_network:
+    external: true
