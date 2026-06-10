@@ -1,272 +1,531 @@
-const express = require('express');
-const cors = require('cors');
-const path = require('path');
+const express  = require('express');
+const cors     = require('cors');
+const path     = require('path');
+const crypto   = require('crypto');
+const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-// ── Users (auth) ────────────────────────────────────────────────
-const users = [
-  { id: 1, username: 'admin',   password: 'admin123',   name: 'Aung Kyaw', role: 'Administrator' },
-  { id: 2, username: 'manager', password: 'manager123', name: 'Su Su',     role: 'Manager'       },
-  { id: 3, username: 'aung',    password: 'aung123',    name: 'Aung Kyaw', role: 'Member'        },
-  { id: 4, username: 'ceo',     password: 'ceo123',     name: 'CEO',       role: 'Administrator' },
-];
+// ── Supabase client ──────────────────────────────────────────────
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_KEY
+);
 
-app.post('/api/login', (req, res) => {
-  const { username, password } = req.body || {};
-  const user = users.find(u => u.username === username && u.password === password);
-  if (!user) return res.status(401).json({ success: false, message: 'Invalid username or password.' });
-  const { password: _pw, ...safe } = user;
-  res.json({ success: true, user: safe });
+// ── Session store (in-memory — ephemeral by nature) ──────────────
+const SESSION_TTL = 8 * 60 * 60 * 1000;
+const sessions    = new Map();
+
+// ── Access levels ─────────────────────────────────────────────────
+const ACCESS_LEVEL = {
+  CEO: 4, President: 4,
+  VicePresident: 3, Advisor: 1, SeniorManager: 3,
+  DepartmentManager: 2, Supervisor: 2,
+  TeamLeader: 1, DepartmentMember: 1,
+};
+const levelOf = role => ACCESS_LEVEL[role] || 1;
+
+// ── Hierarchy levels ─────────────────────────────────────────────
+const HIERARCHY_LEVELS = [
+  { value: 'CEO',               tier: 1, label: 'CEO'                },
+  { value: 'President',         tier: 2, label: 'President'          },
+  { value: 'VicePresident',     tier: 3, label: 'Vice President'     },
+  { value: 'Advisor',           tier: 3, label: 'Advisor'            },
+  { value: 'SeniorManager',     tier: 4, label: 'Senior Manager'     },
+  { value: 'DepartmentManager', tier: 5, label: 'Department Manager' },
+  { value: 'Supervisor',        tier: 6, label: 'Supervisor'         },
+  { value: 'TeamLeader',        tier: 7, label: 'Team Leader'        },
+  { value: 'DepartmentMember',  tier: 8, label: 'Department Member'  },
+];
+const tierOf = role => (HIERARCHY_LEVELS.find(l => l.value === role) || { tier: 8 }).tier;
+
+// ── Async wrapper for Express handlers ────────────────────────────
+const wrap = fn => (req, res, next) => fn(req, res, next).catch(next);
+
+// ── requireAuth ───────────────────────────────────────────────────
+const requireAuth = wrap(async (req, res, next) => {
+  const header = req.headers.authorization || '';
+  const token  = header.startsWith('Bearer ') ? header.slice(7) : '';
+  if (!token) return res.status(401).json({ error: 'Authentication required' });
+
+  const session = sessions.get(token);
+  if (!session || session.expiresAt < Date.now()) {
+    sessions.delete(token);
+    return res.status(401).json({ error: 'Session expired — please log in again' });
+  }
+
+  const { data: member } = await supabase.from('members').select('*').eq('id', session.userId).single();
+  if (!member) return res.status(401).json({ error: 'Account not found' });
+
+  session.expiresAt = Date.now() + SESSION_TTL;
+  req.actor = { ...member, accessLevel: Math.max(levelOf(member.role), levelOf(member.secondaryRole)) };
+  next();
 });
 
-// ── Departments ──────────────────────────────────────────────────
-const departments = [
-  { id: 'dept-1', name: 'Executive Management', description: 'Board and executive leadership', level: 0, parentId: null },
-  { id: 'dept-2', name: 'Board',                description: 'Board of directors',             level: 1, parentId: 'dept-1' },
-  { id: 'dept-3', name: 'Administration & HR',  description: 'HR, compliance, admin ops',      level: 1, parentId: 'dept-1' },
-  { id: 'dept-4', name: 'Finance & Procurement',description: 'Finance, budget, procurement',   level: 1, parentId: 'dept-1' },
-  { id: 'dept-5', name: 'IT & Digital Systems', description: 'Technology and digital ops',     level: 1, parentId: 'dept-1' },
-  { id: 'dept-6', name: 'Programs & Activities',description: 'Club programs and events',       level: 1, parentId: 'dept-1' },
-  { id: 'dept-7', name: 'Marketing',             description: 'Branding, campaigns, content',   level: 1, parentId: 'dept-1' },
-  { id: 'dept-8', name: 'Public Relations',     description: 'PR, media, external comms',       level: 1, parentId: 'dept-1' },
-];
-const departmentMap = new Map(departments.map(d => [d.id, d.name]));
-
-// ── In-memory data ──────────────────────────────────────────────
-let members = [
-  { id: 1, name: 'Aung Kyaw', email: 'aung@thuriban.com',    phone: '+95 9 123 456 789', role: 'Admin',   status: 'Active',   joinDate: '2024-01-15', departmentId: 'dept-1', reportsToId: null },
-  { id: 2, name: 'Nay Lin',   email: 'naylin@thuriban.com',  phone: '+95 9 987 654 321', role: 'Member',  status: 'Active',   joinDate: '2024-02-20', departmentId: 'dept-6', reportsToId: 3    },
-  { id: 3, name: 'Su Su',     email: 'susu@thuriban.com',    phone: '+95 9 456 789 123', role: 'Manager', status: 'Active',   joinDate: '2024-03-10', departmentId: 'dept-3', reportsToId: 1    },
-  { id: 4, name: 'Kyaw Zin',  email: 'kyawzin@thuriban.com', phone: '+95 9 321 654 987', role: 'Member',  status: 'Inactive', joinDate: '2024-04-05', departmentId: 'dept-4', reportsToId: 1    },
-  { id: 5, name: 'Mya Mya',   email: 'myamya@thuriban.com',  phone: '+95 9 654 321 789', role: 'Member',  status: 'Active',   joinDate: '2024-05-12', departmentId: 'dept-6', reportsToId: 3    },
-  { id: 6, name: 'Zaw Win',   email: 'zawwin@thuriban.com',  phone: '+95 9 111 222 333', role: 'Member',  status: 'Active',   joinDate: '2025-01-08', departmentId: 'dept-7', reportsToId: 3    },
-];
-
-let tasks = [
-  { id: 1, title: 'Club Annual Meeting',       description: 'Prepare agenda and materials',        status: 'todo',       priority: 'High',   assignee: 'Aung Kyaw', dueDate: '2026-06-15' },
-  { id: 2, title: 'Membership Drive Campaign', description: 'Design and run recruitment campaign', status: 'inprogress', priority: 'Medium', assignee: 'Su Su',     dueDate: '2026-06-20' },
-  { id: 3, title: 'Update Club Website',       description: 'Refresh content and photos',          status: 'inprogress', priority: 'Low',    assignee: 'Nay Lin',   dueDate: '2026-06-25' },
-  { id: 4, title: 'Financial Report Q1',       description: 'Prepare quarterly financial summary', status: 'done',       priority: 'High',   assignee: 'Kyaw Zin',  dueDate: '2026-05-30' },
-  { id: 5, title: 'Sports Event Planning',     description: 'Organize the annual sports day',      status: 'todo',       priority: 'Medium', assignee: 'Mya Mya',   dueDate: '2026-07-01' },
-  { id: 6, title: 'Club Newsletter',           description: 'Write and distribute monthly letter', status: 'done',       priority: 'Low',    assignee: 'Zaw Win',   dueDate: '2026-05-20' },
-];
-
-let messages = [
-  { id: 1, sender: 'Aung Kyaw', avatar: 'AK', text: "Good morning everyone! Ready for today's meeting?",     time: '09:00 AM', date: '2026-06-07' },
-  { id: 2, sender: 'Su Su',     avatar: 'SS', text: "Yes! I've prepared the slides for the presentation.",    time: '09:05 AM', date: '2026-06-07' },
-  { id: 3, sender: 'Nay Lin',   avatar: 'NL', text: 'The venue is confirmed. See you all at 10 AM!',         time: '09:10 AM', date: '2026-06-07' },
-  { id: 4, sender: 'Mya Mya',   avatar: 'MM', text: "Don't forget to bring your membership cards.",          time: '09:15 AM', date: '2026-06-07' },
-  { id: 5, sender: 'Zaw Win',   avatar: 'ZW', text: 'Will the sports day schedule be shared beforehand?',    time: '09:22 AM', date: '2026-06-07' },
-];
-
-let news = [
-  { id: 1, title: 'Annual Club Upgrade Planning',    content: 'Our team is upgrading the Enterprise Management System with RBAC, Org Chart, and Document Management features.', author: 'Aung Kyaw', date: '2026-06-08', tags: ['System', 'Notice'] },
-  { id: 2, title: 'New Membership Campaign Launch',  content: 'The club is launching a new recruitment drive this summer. Reach out to Su Su for registration spec details.',   author: 'Su Su',     date: '2026-06-05', tags: ['Campaign'] },
-  { id: 3, title: 'Quarterly Audit Completed',       content: 'We successfully concluded our Q1 financial review with the leadership committee. Thanks to Kyaw Zin for compilation.', author: 'Kyaw Zin', date: '2026-06-01', tags: ['Audit', 'Finance'] },
-];
-
-let nextMemberId  = 7;
-let nextTaskId    = 7;
-let nextMessageId = 6;
-let nextNewsId    = 4;
-
-// ── Hierarchy validation helper ──────────────────────────────────
-function validateHierarchy(role, reportsToId) {
-  if (!reportsToId) return null; // no supervisor = ok (root)
-  const supervisor = members.find(m => m.id == reportsToId);
-  if (!supervisor) return 'Supervisor not found';
-  if (role === 'Member') {
-    if (!['Manager', 'Admin'].includes(supervisor.role))
-      return 'Members must report to a Manager or Admin';
-  }
-  if (role === 'Manager') {
-    if (supervisor.role !== 'Admin')
-      return 'Managers must report to an Admin / Executive';
-  }
-  return null; // Admin: no constraint
+// ── requireLevel ──────────────────────────────────────────────────
+function requireLevel(n) {
+  return (req, res, next) => {
+    if (req.actor.accessLevel < n)
+      return res.status(403).json({
+        error: `Access denied — this action requires Level ${n}. You have Level ${req.actor.accessLevel}.`
+      });
+    next();
+  };
 }
 
-// ── Stats ────────────────────────────────────────────────────────
-app.get('/api/stats', (req, res) => {
+// ── deptScope ─────────────────────────────────────────────────────
+const deptScope = wrap(async (req, res, next) => {
+  if (req.actor.accessLevel >= 4) return next();
+
+  const targetId = req.params.id ? parseInt(req.params.id) : null;
+  if (targetId) {
+    const { data: target } = await supabase.from('members').select('departmentId').eq('id', targetId).single();
+    if (target && target.departmentId && target.departmentId !== req.actor.departmentId)
+      return res.status(403).json({ error: 'Access denied — target member is outside your department' });
+  }
+
+  const bodyDept = req.body && req.body.departmentId;
+  if (bodyDept && bodyDept !== req.actor.departmentId)
+    return res.status(403).json({ error: 'Access denied — cannot place members in another department' });
+
+  next();
+});
+
+// ── protectRoleAssignment ─────────────────────────────────────────
+function protectRoleAssignment(req, res, next) {
+  if (!req.body) return next();
+  const check = (role, label) => {
+    if (!role) return null;
+    const lvl = levelOf(role);
+    if (lvl >= 4 && req.actor.accessLevel < 4) return `Only Level 4 (CEO/President) can assign Level 4 roles (${label})`;
+    if (lvl > req.actor.accessLevel) return `Cannot assign a role above your own access level (${label})`;
+    return null;
+  };
+  const err = check(req.body.role, 'primary') || check(req.body.secondaryRole, 'secondary');
+  if (err) return res.status(403).json({ error: err });
+  next();
+}
+
+// ── Dept helper ───────────────────────────────────────────────────
+async function getOrCreateDepartmentId(deptName) {
+  if (!deptName) return null;
+  const trimmed = deptName.trim();
+  const { data: existing } = await supabase.from('departments').select('id').ilike('name', trimmed).single();
+  if (existing) return existing.id;
+  const { data: all } = await supabase.from('departments').select('id');
+  const newId = 'dept-' + ((all || []).length + 1);
+  await supabase.from('departments').insert({ id: newId, name: trimmed, description: trimmed + ' Department', level: 1, parentId: 'dept-1' });
+  return newId;
+}
+
+// ── Hierarchy validation ──────────────────────────────────────────
+async function validateHierarchy(role, reportsToId) {
+  if (!reportsToId) return null;
+  const { data: supervisor } = await supabase.from('members').select('role').eq('id', reportsToId).single();
+  if (!supervisor) return 'Supervisor not found';
+  if (tierOf(supervisor.role) >= tierOf(role))
+    return `A ${role} must report to a higher-tier role (cannot report to ${supervisor.role})`;
+  return null;
+}
+
+// ── Auth ──────────────────────────────────────────────────────────
+app.post('/api/login', wrap(async (req, res) => {
+  const { username, password } = req.body || {};
+  const { data: authUser } = await supabase.from('users').select('*').eq('username', username).eq('password', password).single();
+  if (!authUser) return res.status(401).json({ success: false, message: 'Invalid username or password.' });
+
+  const { data: member } = await supabase.from('members').select('*').eq('id', authUser.memberId).single();
+  if (!member) return res.status(500).json({ success: false, message: 'Member record not found.' });
+
+  const token = crypto.randomUUID();
+  sessions.set(token, { userId: member.id, expiresAt: Date.now() + SESSION_TTL });
+
   res.json({
-    totalMembers:    members.length,
-    activeMembers:   members.filter(m => m.status === 'Active').length,
-    totalTasks:      tasks.length,
-    completedTasks:  tasks.filter(t => t.status === 'done').length,
-    inProgressTasks: tasks.filter(t => t.status === 'inprogress').length,
-    pendingTasks:    tasks.filter(t => t.status === 'todo').length,
-    totalMessages:   messages.length,
+    success: true,
+    token,
+    user: {
+      id:            member.id,
+      username:      authUser.username,
+      name:          member.name,
+      role:          member.role,
+      secondaryRole: member.secondaryRole || null,
+      accessLevel:   Math.max(levelOf(member.role), levelOf(member.secondaryRole)),
+      departmentId:  member.departmentId,
+    },
+  });
+}));
+
+app.post('/api/logout', requireAuth, (req, res) => {
+  sessions.delete((req.headers.authorization || '').slice(7));
+  res.json({ success: true });
+});
+
+app.get('/api/me', requireAuth, (req, res) => {
+  res.json({
+    id:           req.actor.id,
+    name:         req.actor.name,
+    role:         req.actor.role,
+    accessLevel:  req.actor.accessLevel,
+    departmentId: req.actor.departmentId,
   });
 });
 
-// ── Dashboard ────────────────────────────────────────────────────
-app.get('/api/dashboard', (req, res) => {
-  const recentMembers = [...members].reverse().slice(0, 5);
-  const recentTasks   = [...tasks].reverse().slice(0, 5);
-  res.json({
-    stats: {
-      totalMembers:    members.length,
-      activeMembers:   members.filter(m => m.status === 'Active').length,
-      totalTasks:      tasks.length,
-      completedTasks:  tasks.filter(t => t.status === 'done').length,
-      inProgressTasks: tasks.filter(t => t.status === 'inprogress').length,
-      pendingTasks:    tasks.filter(t => t.status === 'todo').length,
-      totalMessages:   messages.length,
-    },
-    recentMembers,
-    recentTasks,
-    news,
-  });
-});
+// ── Hierarchy levels ─────────────────────────────────────────────
+app.get('/api/hierarchy-levels', requireAuth, (_req, res) => res.json(HIERARCHY_LEVELS));
 
 // ── Departments ──────────────────────────────────────────────────
-app.get('/api/departments', (req, res) => res.json(departments));
+app.get('/api/departments', requireAuth, wrap(async (_req, res) => {
+  const { data } = await supabase.from('departments').select('*').order('level');
+  res.json(data || []);
+}));
 
-// ── Eligible managers (must be before /api/members/:id) ──────────
-app.get('/api/members/eligible-managers', (req, res) => {
-  const role = req.query.role;
-  let eligible;
-  if (role === 'Member') {
-    eligible = members.filter(m => m.role === 'Manager' || m.role === 'Admin');
-  } else if (role === 'Manager') {
-    eligible = members.filter(m => m.role === 'Admin');
-  } else {
-    eligible = members.filter(m => m.role !== 'Member');
-  }
-  res.json(eligible.map(m => ({ id: m.id, name: m.name, role: m.role, departmentId: m.departmentId })));
-});
+// ── Stats ────────────────────────────────────────────────────────
+app.get('/api/stats', requireAuth, wrap(async (_req, res) => {
+  const [{ data: members }, { data: tasks }, { count: totalMessages }] = await Promise.all([
+    supabase.from('members').select('id, status'),
+    supabase.from('tasks').select('id, status'),
+    supabase.from('messages').select('id', { count: 'exact', head: true }),
+  ]);
+  res.json({
+    totalMembers:    (members || []).length,
+    activeMembers:   (members || []).filter(m => m.status === 'Active').length,
+    totalTasks:      (tasks || []).length,
+    completedTasks:  (tasks || []).filter(t => t.status === 'done').length,
+    inProgressTasks: (tasks || []).filter(t => t.status === 'inprogress').length,
+    pendingTasks:    (tasks || []).filter(t => t.status === 'todo').length,
+    totalMessages:   totalMessages || 0,
+  });
+}));
+
+// ── Dashboard ────────────────────────────────────────────────────
+app.get('/api/dashboard', requireAuth, wrap(async (_req, res) => {
+  const [{ data: allMembers }, { data: allTasks }, { count: totalMessages }, { data: recentMembers }, { data: recentTasks }, { data: news }] = await Promise.all([
+    supabase.from('members').select('id, status'),
+    supabase.from('tasks').select('id, status'),
+    supabase.from('messages').select('id', { count: 'exact', head: true }),
+    supabase.from('members').select('*').order('id', { ascending: false }).limit(5),
+    supabase.from('tasks').select('*').order('id', { ascending: false }).limit(5),
+    supabase.from('news').select('*').order('id', { ascending: false }),
+  ]);
+  res.json({
+    stats: {
+      totalMembers:    (allMembers || []).length,
+      activeMembers:   (allMembers || []).filter(m => m.status === 'Active').length,
+      totalTasks:      (allTasks || []).length,
+      completedTasks:  (allTasks || []).filter(t => t.status === 'done').length,
+      inProgressTasks: (allTasks || []).filter(t => t.status === 'inprogress').length,
+      pendingTasks:    (allTasks || []).filter(t => t.status === 'todo').length,
+      totalMessages:   totalMessages || 0,
+    },
+    recentMembers: recentMembers || [],
+    recentTasks:   recentTasks   || [],
+    news:          news          || [],
+  });
+}));
+
+// ── Eligible supervisors (must be before /api/members/:id) ───────
+app.get('/api/members/eligible-managers', requireAuth, wrap(async (req, res) => {
+  const role = req.query.role || 'DepartmentMember';
+  const myTier = tierOf(role);
+  const { data: members } = await supabase.from('members').select('id, name, role, departmentId');
+  res.json((members || []).filter(m => tierOf(m.role) < myTier));
+}));
 
 // ── Org chart ────────────────────────────────────────────────────
-app.get('/api/org-chart', (req, res) => {
-  const memberMap  = new Map(members.map(m => [m.id, m]));
-  const childrenOf = new Map(); // parentId → child ids
+app.get('/api/org-chart', requireAuth, wrap(async (_req, res) => {
+  const [{ data: allMembers }, { data: depts }] = await Promise.all([
+    supabase.from('members').select('*'),
+    supabase.from('departments').select('id, name, nameAr'),
+  ]);
+
+  // Exclude system accounts (e.g. the "admin" superuser) from the org chart
+  const members = (allMembers || []).filter(m => !m.isSystemAccount);
+
+  const departmentMap   = new Map((depts || []).map(d => [d.id, d.name]));
+  const departmentMapAr = new Map((depts || []).map(d => [d.id, d.nameAr || d.name]));
+  const memberMap     = new Map(members.map(m => [m.id, m]));
+  const childrenOf    = new Map();
+
   for (const m of members) {
     const key = m.reportsToId || '__root__';
     if (!childrenOf.has(key)) childrenOf.set(key, []);
     childrenOf.get(key).push(m.id);
   }
 
-  const root = members.find(m => m.reportsToId === null) || members.find(m => m.role === 'Admin') || members[0];
+  const root = members.find(m => m.reportsToId === null) || members[0];
 
   function buildNode(m) {
-    const deptName = m.departmentId ? (departmentMap.get(m.departmentId) || m.departmentId) : null;
+    if (!m) return null;
     return {
-      id:             m.id,
-      name:           m.name,
-      title:          m.role === 'Admin' ? 'President / CEO' : m.role,
-      role:           m.role,
-      email:          m.email,
-      phone:          m.phone,
-      department:     deptName,
-      departmentId:   m.departmentId,
-      children:       (childrenOf.get(m.id) || []).map(cid => buildNode(memberMap.get(cid))).filter(Boolean),
+      id:            m.id.toString(),
+      name:          m.name,
+      title:         m.title || (HIERARCHY_LEVELS.find(l => l.value === m.role) || {}).label || m.role,
+      role:          m.role,
+      secondaryRole: m.secondaryRole || null,
+      email:         m.email,
+      phone:         m.phone,
+      department:    m.departmentId ? (departmentMap.get(m.departmentId) || m.departmentId) : null,
+      departmentAr:  m.departmentId ? (departmentMapAr.get(m.departmentId) || null) : null,
+      departmentId:  m.departmentId,
+      children:      (childrenOf.get(m.id) || []).map(cid => buildNode(memberMap.get(cid))).filter(Boolean),
     };
   }
 
   res.json(buildNode(root));
-});
+}));
+
+app.put('/api/org-chart', requireAuth, requireLevel(4), wrap(async (req, res) => {
+  const tree = req.body;
+  if (!tree || !tree.id || !tree.name) return res.status(400).json({ error: 'Invalid org chart structure.' });
+
+  const { data: depts } = await supabase.from('departments').select('id, name');
+  const deptByName = new Map((depts || []).map(d => [d.name.toLowerCase(), d.id]));
+  const flatMembers = [];
+
+  async function flatten(node, parentId = null) {
+    let role = node.role || 'DepartmentMember';
+    if (!HIERARCHY_LEVELS.find(l => l.value === role)) role = 'DepartmentMember';
+
+    let departmentId = node.departmentId || null;
+    if (node.department && !departmentId) {
+      const key = node.department.trim().toLowerCase();
+      departmentId = deptByName.get(key) || await getOrCreateDepartmentId(node.department);
+      deptByName.set(key, departmentId);
+    }
+
+    const id = parseInt(node.id);
+    flatMembers.push({
+      ...(isNaN(id) ? {} : { id }),
+      name: node.name, email: node.email || '', phone: node.phone || '',
+      role, status: node.status || 'Active',
+      joinDate: node.joinDate || new Date().toISOString().split('T')[0],
+      departmentId, reportsToId: parentId,
+    });
+
+    for (const child of (node.children || [])) await flatten(child, isNaN(id) ? null : id);
+  }
+
+  await flatten(tree, null);
+  await supabase.from('members').delete().neq('id', 0);
+  const { error } = await supabase.from('members').insert(flatMembers);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true });
+}));
+
+// Drag-and-drop rearrange: move a member under a new parent
+app.patch('/api/members/:id/reparent', requireAuth, requireLevel(4), wrap(async (req, res) => {
+  const memberId  = parseInt(req.params.id);
+  const newParent = req.body.reportsToId ? parseInt(req.body.reportsToId) : null;
+  if (memberId === newParent) return res.status(400).json({ error: 'Cannot make a member report to themselves.' });
+  const { error } = await supabase.from('members').update({ reportsToId: newParent }).eq('id', memberId);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true });
+}));
 
 // ── Members ──────────────────────────────────────────────────────
-app.get('/api/members', (req, res) => res.json(members));
+app.get('/api/members', requireAuth, wrap(async (_req, res) => {
+  const { data } = await supabase.from('members').select('*').order('id');
+  res.json(data || []);
+}));
 
-app.post('/api/members', (req, res) => {
-  const body   = req.body;
-  const role   = body.role || 'Member';
-  const rtoId  = body.reportsToId ? parseInt(body.reportsToId) : null;
-  const err    = validateHierarchy(role, rtoId);
+app.post('/api/members', requireAuth, requireLevel(2), deptScope, protectRoleAssignment, wrap(async (req, res) => {
+  const body = req.body;
+  let role = body.role || 'DepartmentMember';
+  if (!HIERARCHY_LEVELS.find(l => l.value === role)) role = 'DepartmentMember';
+  let secondaryRole = body.secondaryRole || null;
+  if (secondaryRole && !HIERARCHY_LEVELS.find(l => l.value === secondaryRole)) secondaryRole = null;
+  const rtoId = body.reportsToId ? parseInt(body.reportsToId) : null;
+  const err = await validateHierarchy(role, rtoId);
   if (err) return res.status(400).json({ error: err });
+  let departmentId = body.departmentId || (body.department ? await getOrCreateDepartmentId(body.department) : null);
 
-  const member = {
-    id:           nextMemberId++,
-    joinDate:     new Date().toISOString().split('T')[0],
-    status:       'Active',
-    departmentId: null,
-    reportsToId:  null,
-    ...body,
-    role,
-    reportsToId: rtoId,
-  };
-  members.push(member);
-  res.status(201).json(member);
-});
+  const { data, error } = await supabase.from('members').insert({
+    name: body.name, email: body.email || '', phone: body.phone || '',
+    role, secondaryRole, status: body.status || 'Active',
+    joinDate: new Date().toISOString().split('T')[0],
+    departmentId: departmentId || null, reportsToId: rtoId, title: body.title || '',
+  }).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.status(201).json(data);
+}));
 
-app.put('/api/members/:id', (req, res) => {
-  const idx = members.findIndex(m => m.id === parseInt(req.params.id));
-  if (idx === -1) return res.status(404).json({ error: 'Not found' });
+app.put('/api/members/:id', requireAuth, requireLevel(2), deptScope, protectRoleAssignment, wrap(async (req, res) => {
+  const id = parseInt(req.params.id);
+  const { data: existing } = await supabase.from('members').select('*').eq('id', id).single();
+  if (!existing) return res.status(404).json({ error: 'Not found' });
 
-  const body  = req.body;
-  const role  = body.role || members[idx].role;
+  const body = req.body;
+  let role = body.role || existing.role;
+  if (!HIERARCHY_LEVELS.find(l => l.value === role)) role = existing.role;
+  let secondaryRole = 'secondaryRole' in body ? (body.secondaryRole || null) : (existing.secondaryRole || null);
+  if (secondaryRole && !HIERARCHY_LEVELS.find(l => l.value === secondaryRole)) secondaryRole = null;
   const rtoId = body.reportsToId !== undefined
     ? (body.reportsToId ? parseInt(body.reportsToId) : null)
-    : members[idx].reportsToId;
-
-  const err = validateHierarchy(role, rtoId);
+    : existing.reportsToId;
+  const err = await validateHierarchy(role, rtoId);
   if (err) return res.status(400).json({ error: err });
+  let departmentId = body.departmentId !== undefined ? body.departmentId : existing.departmentId;
+  if (!departmentId && body.department) departmentId = await getOrCreateDepartmentId(body.department);
 
-  members[idx] = { ...members[idx], ...body, role, reportsToId: rtoId };
-  res.json(members[idx]);
-});
+  const { id: _id, ...rest } = body;
+  const { data, error } = await supabase.from('members')
+    .update({ ...rest, role, secondaryRole, reportsToId: rtoId, departmentId })
+    .eq('id', id).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+}));
 
-app.delete('/api/members/:id', (req, res) => {
-  members = members.filter(m => m.id !== parseInt(req.params.id));
+app.delete('/api/members/:id', requireAuth, requireLevel(2), deptScope, wrap(async (req, res) => {
+  const memberId = parseInt(req.params.id);
+  const { data: target } = await supabase.from('members').select('reportsToId').eq('id', memberId).single();
+  if (!target) return res.status(404).json({ error: 'Member not found' });
+
+  // Delete user accounts linked to a member (FK constraint: users.memberId → members.id)
+  async function deleteUserAndMember(mid) {
+    await supabase.from('users').delete().eq('memberId', mid);
+    await supabase.from('members').delete().eq('id', mid);
+  }
+
+  if (req.query.promote === 'true') {
+    await supabase.from('members').update({ reportsToId: target.reportsToId }).eq('reportsToId', memberId);
+  } else {
+    async function deleteSubtree(pid) {
+      const { data: children } = await supabase.from('members').select('id').eq('reportsToId', pid);
+      for (const c of (children || [])) { await deleteSubtree(c.id); await deleteUserAndMember(c.id); }
+    }
+    await deleteSubtree(memberId);
+  }
+  await deleteUserAndMember(memberId);
   res.json({ success: true });
-});
+}));
 
 // ── Tasks ────────────────────────────────────────────────────────
-app.get('/api/tasks', (req, res) => res.json(tasks));
+app.get('/api/tasks', requireAuth, wrap(async (_req, res) => {
+  const { data } = await supabase.from('tasks').select('*').order('id');
+  res.json(data || []);
+}));
 
-app.post('/api/tasks', (req, res) => {
-  const task = { id: nextTaskId++, ...req.body };
-  tasks.push(task);
-  res.status(201).json(task);
-});
+app.post('/api/tasks', requireAuth, requireLevel(2), wrap(async (req, res) => {
+  const { data, error } = await supabase.from('tasks').insert(req.body).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.status(201).json(data);
+}));
 
-app.put('/api/tasks/:id', (req, res) => {
-  const idx = tasks.findIndex(t => t.id === parseInt(req.params.id));
-  if (idx === -1) return res.status(404).json({ error: 'Not found' });
-  tasks[idx] = { ...tasks[idx], ...req.body };
-  res.json(tasks[idx]);
-});
+app.put('/api/tasks/:id', requireAuth, requireLevel(2), wrap(async (req, res) => {
+  const { data, error } = await supabase.from('tasks').update(req.body).eq('id', parseInt(req.params.id)).select().single();
+  if (error) return res.status(404).json({ error: 'Not found' });
+  res.json(data);
+}));
 
-app.delete('/api/tasks/:id', (req, res) => {
-  tasks = tasks.filter(t => t.id !== parseInt(req.params.id));
+app.delete('/api/tasks/:id', requireAuth, requireLevel(3), wrap(async (req, res) => {
+  await supabase.from('tasks').delete().eq('id', parseInt(req.params.id));
   res.json({ success: true });
-});
+}));
 
 // ── Messages ─────────────────────────────────────────────────────
-app.get('/api/messages', (req, res) => res.json(messages));
+app.get('/api/messages', requireAuth, wrap(async (_req, res) => {
+  const { data } = await supabase.from('messages').select('*').order('id');
+  res.json(data || []);
+}));
 
-app.post('/api/messages', (req, res) => {
-  const msg = {
-    id:     nextMessageId++,
-    time:   new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
-    date:   new Date().toISOString().split('T')[0],
+app.post('/api/messages', requireAuth, wrap(async (req, res) => {
+  const { data, error } = await supabase.from('messages').insert({
     ...req.body,
-  };
-  messages.push(msg);
-  res.status(201).json(msg);
-});
+    time: new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
+    date: new Date().toISOString().split('T')[0],
+  }).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.status(201).json(data);
+}));
+
+// ── Channels ─────────────────────────────────────────────────────
+app.get('/api/channels', requireAuth, wrap(async (_req, res) => {
+  const { data } = await supabase.from('channels').select('*').order('id');
+  res.json(data || []);
+}));
+
+app.post('/api/channels', requireAuth, requireLevel(3), wrap(async (req, res) => {
+  const { name, icon } = req.body || {};
+  if (!name || !name.trim()) return res.status(400).json({ error: 'Channel name is required' });
+  const { data: last } = await supabase.from('channels').select('id').order('id', { ascending: false }).limit(1);
+  const lastNum = last && last.length ? parseInt((last[0].id || 'ch-0').replace('ch-', '')) : 0;
+  const { data, error } = await supabase.from('channels').insert({
+    id:           `ch-${lastNum + 1}`,
+    name:         name.trim(),
+    icon:         icon || 'fa-hashtag',
+    departmentId: req.actor.accessLevel >= 4 ? (req.body.departmentId || null) : req.actor.departmentId,
+    createdBy:    req.actor.id,
+  }).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.status(201).json(data);
+}));
 
 // ── News ─────────────────────────────────────────────────────────
-app.get('/api/news', (req, res) => res.json(news));
+app.get('/api/news', requireAuth, wrap(async (_req, res) => {
+  const { data } = await supabase.from('news').select('*').order('id', { ascending: false });
+  res.json(data || []);
+}));
 
-app.post('/api/news', (req, res) => {
-  const item = { id: nextNewsId++, date: new Date().toISOString().split('T')[0], tags: req.body.tags || ['Notice'], ...req.body };
-  news.unshift(item);
-  res.status(201).json(item);
-});
+app.post('/api/news', requireAuth, requireLevel(4), wrap(async (req, res) => {
+  const { data, error } = await supabase.from('news').insert({
+    ...req.body,
+    date: new Date().toISOString().split('T')[0],
+    tags: req.body.tags || ['Notice'],
+  }).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.status(201).json(data);
+}));
 
-app.delete('/api/news/:id', (req, res) => {
-  news = news.filter(n => n.id !== parseInt(req.params.id));
+app.delete('/api/news/:id', requireAuth, requireLevel(4), wrap(async (req, res) => {
+  await supabase.from('news').delete().eq('id', parseInt(req.params.id));
   res.json({ success: true });
+}));
+
+// ── Documents ────────────────────────────────────────────────────
+app.get('/api/documents', requireAuth, wrap(async (req, res) => {
+  const { data } = await supabase.from('documents').select('*')
+    .lte('minAccessLevel', req.actor.accessLevel).order('id');
+  res.json(data || []);
+}));
+
+app.post('/api/documents', requireAuth, requireLevel(4), wrap(async (req, res) => {
+  const { title, description, filename, url, minAccessLevel } = req.body || {};
+  if (!title || !title.trim()) return res.status(400).json({ error: 'Title is required' });
+  const { data, error } = await supabase.from('documents').insert({
+    title: title.trim(),
+    description: (description || '').trim(),
+    filename:    (filename    || '').trim(),
+    url:         (url         || '').trim(),
+    uploadedBy:  req.actor.name,
+    uploadedAt:  new Date().toISOString().split('T')[0],
+    minAccessLevel: Math.min(4, Math.max(1, parseInt(minAccessLevel) || 1)),
+  }).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.status(201).json(data);
+}));
+
+app.put('/api/documents/:id/access', requireAuth, requireLevel(4), wrap(async (req, res) => {
+  const { data, error } = await supabase.from('documents')
+    .update({ minAccessLevel: Math.min(4, Math.max(1, parseInt(req.body.minAccessLevel) || 1)) })
+    .eq('id', parseInt(req.params.id)).select().single();
+  if (error) return res.status(404).json({ error: 'Document not found' });
+  res.json(data);
+}));
+
+app.delete('/api/documents/:id', requireAuth, requireLevel(4), wrap(async (req, res) => {
+  await supabase.from('documents').delete().eq('id', parseInt(req.params.id));
+  res.json({ success: true });
+}));
+
+// ── Global error handler ──────────────────────────────────────────
+app.use((err, _req, res, _next) => {
+  console.error(err);
+  res.status(500).json({ error: 'Internal server error' });
 });
 
 // ── Start ─────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`\n  Thuriban Club Mgm  |  http://localhost:${PORT}\n`);
-});
+app.listen(PORT, () => console.log(`\n  Thuriban Club Mgm  |  http://localhost:${PORT}\n`));
