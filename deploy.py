@@ -10,7 +10,7 @@ REMOTE   = '/opt/thuriban'
 LOCAL    = r'c:\Users\moham\Desktop\Mgm Thuriban\backend'
 
 UPLOAD_FILES = ['server.js', 'package.json', 'package-lock.json',
-                'Dockerfile', 'docker-compose.yml', '.dockerignore']
+                'Dockerfile', 'docker-compose.yml', '.dockerignore', '.env']
 UPLOAD_DIRS  = ['public']
 
 def banner(msg):

@@ -1845,10 +1845,23 @@ function Login({ onLogin, t, lang }) {
 
   useEffect(() => {
     let interval;
-    const initGoogle = () => {
+    const initGoogle = async () => {
+      let clientId = '1234567890-placeholder.apps.googleusercontent.com';
+      try {
+        const configRes = await fetch(`${API}/api/config`);
+        if (configRes.ok) {
+          const configData = await configRes.json();
+          if (configData.googleClientId) {
+            clientId = configData.googleClientId;
+          }
+        }
+      } catch (e) {
+        console.warn('Failed to fetch dynamic Google client ID config, falling back to default', e);
+      }
+
       if (window.google && window.google.accounts && window.google.accounts.id) {
         window.google.accounts.id.initialize({
-          client_id: '1234567890-placeholder.apps.googleusercontent.com',
+          client_id: clientId,
           callback: handleGoogleCredentialResponse,
         });
         const container = document.getElementById('google-signin-btn');

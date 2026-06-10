@@ -383,6 +383,13 @@ app.post('/api/admin/seed-user', requireAuth, requireLevel(4), wrap(async (req, 
   });
 }));
 
+// ── Public Config Endpoint ────────────────────────────────────────
+app.get('/api/config', (_req, res) => {
+  res.json({
+    googleClientId: process.env.GOOGLE_CLIENT_ID || '1234567890-placeholder.apps.googleusercontent.com'
+  });
+});
+
 app.post('/api/logout', requireAuth, (req, res) => {
   sessions.delete((req.headers.authorization || '').slice(7));
   res.json({ success: true });

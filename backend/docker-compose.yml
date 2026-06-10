@@ -8,6 +8,7 @@ services:
       - PORT=3000
       - SUPABASE_URL=https://fyvncfkmoshfyvdlpgie.supabase.co
       - SUPABASE_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZ5dm5jZmttb3NoZnl2ZGxwZ2llIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODEwNDQ2MjEsImV4cCI6MjA5NjYyMDYyMX0.sdX2tnC1KUiA3yjoa7wO6EsqNmOVsSVugXVO_v7zALo
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}
     networks:
       - proxy_network
 
