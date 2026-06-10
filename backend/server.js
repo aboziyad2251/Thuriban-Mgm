@@ -45,6 +45,70 @@ const tierOf = role => (HIERARCHY_LEVELS.find(l => l.value === role) || { tier: 
 // ── Async wrapper for Express handlers ────────────────────────────
 const wrap = fn => (req, res, next) => fn(req, res, next).catch(next);
 
+// ── JWT Helpers ───────────────────────────────────────────────────
+const JWT_SECRET = process.env.JWT_SECRET || 'thuriban-super-secret-key-123456';
+
+function base64urlEncode(str) {
+  return Buffer.from(str)
+    .toString('base64')
+    .replace(/=/g, '')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_');
+}
+
+function base64urlDecode(str) {
+  str = str.replace(/-/g, '+').replace(/_/g, '/');
+  const pads = 4 - (str.length % 4);
+  if (pads !== 4) str += '='.repeat(pads);
+  return Buffer.from(str, 'base64').toString('utf8');
+}
+
+function jwtSign(payload) {
+  const header = { alg: 'HS256', typ: 'JWT' };
+  const now = Math.floor(Date.now() / 1000);
+  const body = { ...payload, exp: now + 24 * 60 * 60 }; // 24h
+
+  const encHeader = base64urlEncode(JSON.stringify(header));
+  const encPayload = base64urlEncode(JSON.stringify(body));
+  const signature = crypto
+    .createHmac('sha256', JWT_SECRET)
+    .update(`${encHeader}.${encPayload}`)
+    .digest('base64')
+    .replace(/=/g, '')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_');
+
+  return `${encHeader}.${encPayload}.${signature}`;
+}
+
+function jwtVerify(token) {
+  const parts = token.split('.');
+  if (parts.length !== 3) return null;
+  const [encHeader, encPayload, encSignature] = parts;
+
+  const expectedSig = crypto
+    .createHmac('sha256', JWT_SECRET)
+    .update(`${encHeader}.${encPayload}`)
+    .digest('base64')
+    .replace(/=/g, '')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_');
+
+  if (encSignature !== expectedSig) return null;
+
+  let payload;
+  try {
+    payload = JSON.parse(base64urlDecode(encPayload));
+  } catch {
+    return null;
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  if (payload.exp && payload.exp < now) return null;
+
+  return payload;
+}
+
 // ── requireAuth ───────────────────────────────────────────────────
 const requireAuth = wrap(async (req, res, next) => {
   const header = req.headers.authorization || '';
@@ -52,18 +116,32 @@ const requireAuth = wrap(async (req, res, next) => {
   if (!token) return res.status(401).json({ error: 'Authentication required' });
 
   const session = sessions.get(token);
-  if (!session || session.expiresAt < Date.now()) {
-    sessions.delete(token);
-    return res.status(401).json({ error: 'Session expired — please log in again' });
+  if (session && session.expiresAt > Date.now()) {
+    const { data: member } = await supabase.from('members').select('*').eq('id', session.userId).single();
+    if (!member) {
+      sessions.delete(token);
+      return res.status(401).json({ error: 'Account not found' });
+    }
+
+    session.expiresAt = Date.now() + SESSION_TTL;
+    req.actor = { ...member, accessLevel: Math.max(levelOf(member.role), levelOf(member.secondaryRole)) };
+    return next();
   }
 
-  const { data: member } = await supabase.from('members').select('*').eq('id', session.userId).single();
-  if (!member) return res.status(401).json({ error: 'Account not found' });
+  const payload = jwtVerify(token);
+  if (payload) {
+    const userId = payload.id;
+    const { data: member } = await supabase.from('members').select('*').eq('id', userId).single();
+    if (!member) return res.status(401).json({ error: 'Account not found' });
 
-  session.expiresAt = Date.now() + SESSION_TTL;
-  req.actor = { ...member, accessLevel: Math.max(levelOf(member.role), levelOf(member.secondaryRole)) };
-  next();
+    req.actor = { ...member, accessLevel: Math.max(levelOf(member.role), levelOf(member.secondaryRole)) };
+    return next();
+  }
+
+  if (session) sessions.delete(token);
+  return res.status(401).json({ error: 'Session expired — please log in again' });
 });
+
 
 // ── requireLevel ──────────────────────────────────────────────────
 function requireLevel(n) {
@@ -158,6 +236,153 @@ app.post('/api/login', wrap(async (req, res) => {
   });
 }));
 
+// ── Google OAuth Route ────────────────────────────────────────────
+app.post('/api/auth/google', wrap(async (req, res) => {
+  const { token } = req.body;
+  if (!token) return res.status(401).json({ error: 'Missing Google token' });
+
+  const response = await fetch(`https://oauth2.googleapis.com/tokeninfo?id_token=${token}`);
+  if (!response.ok) return res.status(401).json({ error: 'Invalid Google token' });
+
+  const data = await response.json();
+  if (!data.email || (data.email_verified !== 'true' && data.email_verified !== true)) {
+    return res.status(401).json({ error: 'Invalid Google token' });
+  }
+
+  const email = data.email;
+
+  const { data: member, error } = await supabase.from('members').select('*').eq('email', email).single();
+  if (error || !member) {
+    return res.status(401).json({ error: 'Not Authorized' });
+  }
+
+  const user = {
+    id: member.id,
+    name: member.name,
+    role: member.role,
+    secondaryRole: member.secondaryRole,
+    accessLevel: Math.max(levelOf(member.role), levelOf(member.secondaryRole)),
+    departmentId: member.departmentId,
+  };
+
+  const jwtToken = jwtSign(user);
+
+  sessions.set(jwtToken, { userId: member.id, expiresAt: Date.now() + SESSION_TTL });
+
+  return res.json({ success: true, token: jwtToken, user });
+}));
+
+// ── Seed User Endpoint ────────────────────────────────────────────
+app.post('/api/admin/seed-user', requireAuth, requireLevel(4), wrap(async (req, res) => {
+  const { name, email, department, accessLevel, username, password } = req.body || {};
+
+  // Validate required fields
+  if (!name || !name.trim() || !email || !email.trim()) {
+    return res.status(400).json({ error: 'Name and email are required' });
+  }
+
+  const numericLevel = Number(accessLevel);
+  if (isNaN(numericLevel) || ![1, 2, 3, 4].includes(numericLevel)) {
+    return res.status(400).json({ error: 'Invalid access level' });
+  }
+
+  const normalizedEmail = email.trim().toLowerCase();
+
+  // Check email uniqueness
+  const { data: existingMember } = await supabase
+    .from('members')
+    .select('id')
+    .eq('email', normalizedEmail)
+    .maybeSingle();
+
+  if (existingMember) {
+    return res.status(400).json({ error: 'Email already exists' });
+  }
+
+  const finalUsername = (username && username.trim()) ? username.trim() : normalizedEmail.split('@')[0].trim().toLowerCase();
+  const finalPassword = (password && password.trim()) ? password.trim() : 'Pass123';
+
+  // Check username uniqueness
+  const { data: existingUser } = await supabase
+    .from('users')
+    .select('id')
+    .eq('username', finalUsername)
+    .maybeSingle();
+
+  if (existingUser) {
+    return res.status(400).json({ error: 'Username already exists' });
+  }
+
+  // Resolve department
+  const departmentId = department ? await getOrCreateDepartmentId(department.trim()) : null;
+
+  // Map access level to role and title
+  let role, title;
+  switch (numericLevel) {
+    case 4:
+      role = 'CEO';
+      title = 'Chief Executive Officer';
+      break;
+    case 3:
+      role = 'SeniorManager';
+      title = 'Senior Manager';
+      break;
+    case 2:
+      role = 'DepartmentManager';
+      title = 'Department Manager';
+      break;
+    case 1:
+      role = 'DepartmentMember';
+      title = 'Member';
+      break;
+    default:
+      return res.status(400).json({ error: 'Invalid access level' });
+  }
+
+  const joinDate = new Date().toISOString().split('T')[0];
+
+  // Insert member
+  const { data: member, error: memberErr } = await supabase
+    .from('members')
+    .insert({
+      name: name.trim(),
+      email: normalizedEmail,
+      role,
+      status: 'Active',
+      joinDate,
+      departmentId,
+      title
+    })
+    .select()
+    .single();
+
+  if (memberErr) {
+    return res.status(500).json({ error: memberErr.message });
+  }
+
+  // Insert user
+  const { error: userErr } = await supabase
+    .from('users')
+    .insert({
+      username: finalUsername,
+      password: finalPassword,
+      memberId: member.id
+    });
+
+  if (userErr) {
+    // Rollback member
+    await supabase.from('members').delete().eq('id', member.id);
+    return res.status(500).json({ error: userErr.message });
+  }
+
+  return res.status(201).json({
+    success: true,
+    member,
+    username: finalUsername,
+    password: finalPassword
+  });
+}));
+
 app.post('/api/logout', requireAuth, (req, res) => {
   sessions.delete((req.headers.authorization || '').slice(7));
   res.json({ success: true });
@@ -208,7 +433,7 @@ app.get('/api/dashboard', requireAuth, wrap(async (_req, res) => {
     supabase.from('messages').select('id', { count: 'exact', head: true }),
     supabase.from('members').select('*').order('id', { ascending: false }).limit(5),
     supabase.from('tasks').select('*').order('id', { ascending: false }).limit(5),
-    supabase.from('news').select('*').order('id', { ascending: false }),
+    supabase.from('news').select('*').eq('status', 'approved').order('id', { ascending: false }),
   ]);
   res.json({
     stats: {
@@ -465,18 +690,42 @@ app.post('/api/channels', requireAuth, requireLevel(3), wrap(async (req, res) =>
 
 // ── News ─────────────────────────────────────────────────────────
 app.get('/api/news', requireAuth, wrap(async (_req, res) => {
-  const { data } = await supabase.from('news').select('*').order('id', { ascending: false });
+  const { data } = await supabase.from('news').select('*').eq('status', 'approved').order('id', { ascending: false });
   res.json(data || []);
 }));
 
-app.post('/api/news', requireAuth, requireLevel(4), wrap(async (req, res) => {
+app.get('/api/news/pending', requireAuth, requireLevel(4), wrap(async (_req, res) => {
+  const { data } = await supabase.from('news').select('*').eq('status', 'pending').order('id', { ascending: false });
+  res.json(data || []);
+}));
+
+app.post('/api/news', requireAuth, wrap(async (req, res) => {
+  const status = req.actor.accessLevel >= 4 ? 'approved' : 'pending';
   const { data, error } = await supabase.from('news').insert({
     ...req.body,
+    author: req.body.author || req.actor.name,
     date: new Date().toISOString().split('T')[0],
     tags: req.body.tags || ['Notice'],
+    status,
   }).select().single();
   if (error) return res.status(500).json({ error: error.message });
   res.status(201).json(data);
+}));
+
+app.patch('/api/news/:id/approve', requireAuth, requireLevel(4), wrap(async (req, res) => {
+  const { data, error } = await supabase.from('news')
+    .update({ status: 'approved' })
+    .eq('id', parseInt(req.params.id)).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+}));
+
+app.patch('/api/news/:id/reject', requireAuth, requireLevel(4), wrap(async (req, res) => {
+  const { data, error } = await supabase.from('news')
+    .update({ status: 'rejected' })
+    .eq('id', parseInt(req.params.id)).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
 }));
 
 app.delete('/api/news/:id', requireAuth, requireLevel(4), wrap(async (req, res) => {
