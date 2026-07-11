@@ -232,6 +232,7 @@ app.post('/api/login', wrap(async (req, res) => {
       secondaryRole: member.secondaryRole || null,
       accessLevel:   Math.max(levelOf(member.role), levelOf(member.secondaryRole)),
       departmentId:  member.departmentId,
+      showOnBoard:   member.show_on_board || false,
     },
   });
 }));
@@ -263,6 +264,7 @@ app.post('/api/auth/google', wrap(async (req, res) => {
     secondaryRole: member.secondaryRole,
     accessLevel: Math.max(levelOf(member.role), levelOf(member.secondaryRole)),
     departmentId: member.departmentId,
+    showOnBoard: member.show_on_board || false,
   };
 
   const jwtToken = jwtSign(user);
@@ -634,6 +636,46 @@ app.delete('/api/members/:id', requireAuth, requireLevel(2), deptScope, wrap(asy
   res.json({ success: true });
 }));
 
+// ── Board access middleware ──────────────────────────────────────
+function requireBoardAccess(req, res, next) {
+  if (req.actor.accessLevel >= 4 || req.actor.show_on_board)
+    return next();
+  return res.status(403).json({ error: 'Board access required' });
+}
+
+// ── Board chat ───────────────────────────────────────────────────
+app.get('/api/board-chat', requireAuth, requireBoardAccess, wrap(async (_req, res) => {
+  const { data } = await supabase.from('board_messages').select('*').order('id');
+  res.json(data || []);
+}));
+
+app.post('/api/board-chat', requireAuth, requireBoardAccess, wrap(async (req, res) => {
+  const { content, attachment_data, attachment_name, attachment_type } = req.body || {};
+  if (!content?.trim() && !attachment_data)
+    return res.status(400).json({ error: 'Empty message' });
+  const { data, error } = await supabase.from('board_messages').insert({
+    sender_id:       req.actor.id,
+    sender_name:     req.actor.name,
+    content:         content?.trim() || null,
+    attachment_data: attachment_data || null,
+    attachment_name: attachment_name || null,
+    attachment_type: attachment_type || null,
+  }).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.status(201).json(data);
+}));
+
+// ── Board visibility toggle ──────────────────────────────────────
+app.patch('/api/members/:id/show-on-board', requireAuth, requireLevel(4), wrap(async (req, res) => {
+  const id = parseInt(req.params.id);
+  const { show } = req.body; // boolean
+  const { data, error } = await supabase.from('members')
+    .update({ show_on_board: !!show })
+    .eq('id', id).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+}));
+
 // ── Tasks ────────────────────────────────────────────────────────
 app.get('/api/tasks', requireAuth, wrap(async (_req, res) => {
   const { data } = await supabase.from('tasks').select('*').order('id');
@@ -742,12 +784,16 @@ app.delete('/api/news/:id', requireAuth, requireLevel(4), wrap(async (req, res) 
 
 // ── Documents ────────────────────────────────────────────────────
 app.get('/api/documents', requireAuth, wrap(async (req, res) => {
-  const { data } = await supabase.from('documents').select('*')
-    .lte('minAccessLevel', req.actor.accessLevel).order('id');
+  let query = supabase.from('documents').select('*').order('id');
+  // Board-selected members and admins see all docs; others filtered by minAccessLevel
+  if (!req.actor.show_on_board && req.actor.accessLevel < 4) {
+    query = query.lte('minAccessLevel', req.actor.accessLevel);
+  }
+  const { data } = await query;
   res.json(data || []);
 }));
 
-app.post('/api/documents', requireAuth, requireLevel(4), wrap(async (req, res) => {
+app.post('/api/documents', requireAuth, requireLevel(3), wrap(async (req, res) => {
   const { title, description, filename, url, minAccessLevel } = req.body || {};
   if (!title || !title.trim()) return res.status(400).json({ error: 'Title is required' });
   const { data, error } = await supabase.from('documents').insert({
@@ -763,7 +809,26 @@ app.post('/api/documents', requireAuth, requireLevel(4), wrap(async (req, res) =
   res.status(201).json(data);
 }));
 
-app.put('/api/documents/:id/access', requireAuth, requireLevel(4), wrap(async (req, res) => {
+app.put('/api/documents/:id', requireAuth, requireLevel(3), wrap(async (req, res) => {
+  const { title, description, filename, url, minAccessLevel } = req.body || {};
+  const { data: existing } = await supabase.from('documents').select('id').eq('id', parseInt(req.params.id)).single();
+  if (!existing) return res.status(404).json({ error: 'Document not found' });
+
+  const updatePayload = {};
+  if (title !== undefined) updatePayload.title = title.trim();
+  if (description !== undefined) updatePayload.description = (description || '').trim();
+  if (filename !== undefined) updatePayload.filename = (filename || '').trim();
+  if (url !== undefined) updatePayload.url = (url || '').trim();
+  if (minAccessLevel !== undefined) updatePayload.minAccessLevel = Math.min(4, Math.max(1, parseInt(minAccessLevel) || 1));
+
+  const { data, error } = await supabase.from('documents')
+    .update(updatePayload)
+    .eq('id', parseInt(req.params.id)).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+}));
+
+app.put('/api/documents/:id/access', requireAuth, requireLevel(3), wrap(async (req, res) => {
   const { data, error } = await supabase.from('documents')
     .update({ minAccessLevel: Math.min(4, Math.max(1, parseInt(req.body.minAccessLevel) || 1)) })
     .eq('id', parseInt(req.params.id)).select().single();
@@ -771,7 +836,7 @@ app.put('/api/documents/:id/access', requireAuth, requireLevel(4), wrap(async (r
   res.json(data);
 }));
 
-app.delete('/api/documents/:id', requireAuth, requireLevel(4), wrap(async (req, res) => {
+app.delete('/api/documents/:id', requireAuth, requireLevel(3), wrap(async (req, res) => {
   await supabase.from('documents').delete().eq('id', parseInt(req.params.id));
   res.json({ success: true });
 }));
